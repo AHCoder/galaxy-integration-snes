@@ -15,5 +15,5 @@ Download this repository, name it "snes_aa7db44d-b70b-4774-91da-db1034318d3c" an
 * Open user_config.py in your installation folder and set your folder path for your roms and your emulator path etc.
 
 1. When you have an account go here: https://www.giantbomb.com/api/
-2. Place a file named "config.py" in your installation folder with a single line:
+2. Open "user_config.py" in your installation folder and set your API key:
     * api_key = YOUR_KEY_GOES_HERE_IN_QUOTES i.e. api_key = "abcdefghijklmnopqrstuvwxyz"
