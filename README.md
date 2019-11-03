@@ -2,7 +2,7 @@
 SNES Integration for GOG Galaxy 2.0
 
 ## Features
-* Looks for sfc files in a folder you specify
+* Looks for sfc and smc files in a folder you specify
 * Supports launching games with Bsnes
 
 ## Requirements
