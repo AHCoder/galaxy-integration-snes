@@ -29,12 +29,12 @@ class BackendClient:
 
         for rom in self.roms:
             if rom in cache:
-                search_results = cache.get("rom")
+                search_results = cache.get(rom)
             else:    
                 url = QUERY_URL.format(user_config.api_key, urllib.parse.quote(rom))            
                 with urllib.request.urlopen(url) as response:
                     search_results = json.loads(response.read())
-                cache["rom"] = search_results
+                cache[rom] = search_results
             
             self.games.append(
                 SNESGame(
