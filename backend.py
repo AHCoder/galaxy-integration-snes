@@ -29,12 +29,12 @@ class BackendClient:
 
         for rom in self.roms:
             if rom in cache:
-                search_results = cache.get("rom")
+                search_results = cache.get(rom)
             else:    
                 url = QUERY_URL.format(user_config.api_key, urllib.parse.quote(rom))            
                 with urllib.request.urlopen(url) as response:
                     search_results = json.loads(response.read())
-                cache["rom"] = search_results
+                cache[rom] = search_results
             
             self.games.append(
                 SNESGame(
@@ -55,7 +55,7 @@ class BackendClient:
         '''        
         for root, dirs, files in os.walk(user_config.roms_path):
             for file in files:
-               if file.lower().endswith(".sfc"):
+               if (file.lower().endswith(".sfc")) or (file.lower().endswith(".smc")):
                     name = os.path.splitext(os.path.basename(file))[0] # Split name of file from it's path/extension
                     path = os.path.join(root, file)
                     self.roms[name] = path
