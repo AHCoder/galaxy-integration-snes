@@ -55,7 +55,7 @@ class BackendClient:
         '''        
         for root, dirs, files in os.walk(user_config.roms_path):
             for file in files:
-               if file.lower().endswith(".sfc"):
+               if (file.lower().endswith(".sfc")) or (file.lower().endswith(".smc")):
                     name = os.path.splitext(os.path.basename(file))[0] # Split name of file from it's path/extension
                     path = os.path.join(root, file)
                     self.roms[name] = path
