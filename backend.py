@@ -6,13 +6,13 @@ import urllib.request
 
 import user_config
 from definitions import SNESGame
+from galaxy.api.types import LocalGame, LocalGameState
 
 QUERY_URL = "https://www.giantbomb.com/api/search/?api_key={}&field_list=id,name&format=json&limit=1&query={}&resources=game"
 
 class BackendClient:
-    def __init__(self, plugin_instance):
+    def __init__(self):
         self.games = []
-        self.plugin_instance = plugin_instance
         self.roms = {}
         self.start_time = 0
         self.end_time = 0
@@ -24,27 +24,23 @@ class BackendClient:
         Used if the user chooses to pull from Giant Bomb database
         The first result is used and only call for id and name, in json format, limited to 1 result
         '''
-        cache = self.plugin_instance.persistent_cache
         self._get_rom_names()
 
         for rom in self.roms:
-            if rom in cache:
-                search_results = cache.get(rom)
-            else:    
-                url = QUERY_URL.format(user_config.api_key, urllib.parse.quote(rom))            
-                with urllib.request.urlopen(url) as response:
-                    search_results = json.loads(response.read())
-                cache[rom] = search_results
-            
+            url = QUERY_URL.format(user_config.api_key, urllib.parse.quote(rom))            
+            with urllib.request.urlopen(url) as response:
+                search_results = json.loads(response.read())
+
+            id = search_results["results"][0]["id"]
+            name = search_results["results"][0]["name"]
             self.games.append(
                 SNESGame(
-                    str(search_results["results"][0]["id"]),
-                    str(search_results["results"][0]["name"]),
+                    str(id),
+                    str(name),
                     str(self.roms.get(rom))
                 )
             )
 
-        self.plugin_instance.push_cache()
         return self.games
 
 
@@ -55,7 +51,7 @@ class BackendClient:
         '''        
         for root, dirs, files in os.walk(user_config.roms_path):
             for file in files:
-               if (file.lower().endswith(".sfc")) or (file.lower().endswith(".smc")):
+               if file.lower().endswith((".sfc", ".smc")):
                     name = os.path.splitext(os.path.basename(file))[0] # Split name of file from it's path/extension
                     path = os.path.join(root, file)
                     self.roms[name] = path

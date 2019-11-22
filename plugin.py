@@ -17,14 +17,12 @@ from version import __version__
 class SuperNintendoEntertainmentSystemPlugin(Plugin):
     def __init__(self, reader, writer, token):
         super().__init__(Platform.SuperNintendoEntertainmentSystem, __version__, reader, writer, token)
-        self.backend_client = BackendClient(self)
+        self.backend_client = BackendClient()
         self.games = []
         self.local_games_cache = []
         self.proc = None
         self.running_game_id = ""
         self.tick_count = 0
-
-        self.create_task(self._update_local_games(), "Update local games")
 
         
     async def authenticate(self, stored_credentials=None):
@@ -97,11 +95,7 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         # Check if the file exists, otherwise create it with defaults
         if not os.path.exists(path):
             for game in self.games:
-                data[game.id] = {
-                    "name" : game.name,
-                    "time_played" : 0,
-                    "last_time_played" : None
-                }
+                data[game.id] = { "name": game.name, "time_played": 0, "last_time_played": None }
 
             with open(path, "w", encoding="utf-8") as game_times_file:
                 json.dump(data, game_times_file, indent=4)
@@ -126,25 +120,29 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         '''
         local_games = []        
         for game in self.games:
+            state = LocalGameState.Installed
+            if self.running_game_id == game.id:
+                state |= LocalGameState.Running
+
             local_games.append(
                 LocalGame(
                     game.id,
-                    LocalGameState.Installed
+                    state
                 )
             )
         return local_games
 
 
     def tick(self):
-        self.tick_count += 1
-        
-        self._check_proc_status()
+        self._check_emu_status()
         self.create_task(self._update_local_games(), "Update local games")
-        if self.tick_count % 3 == 0:
+        self.tick_count += 1
+
+        if self.tick_count % 12 == 0:
             self.create_task(self._update_all_game_times(), "Update all game times")
 
 
-    def _check_proc_status(self) -> None:
+    def _check_emu_status(self) -> None:
         try:
             if(self.proc.poll() is not None):
                 self.backend_client._set_session_end()
@@ -152,6 +150,7 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
                 last_time_played = int(time.time())
                 self._update_game_time(self.running_game_id, session_duration, last_time_played)
                 self.proc = None
+                self.running_game_id = ""
         except AttributeError:
             pass
 
@@ -161,6 +160,7 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         new_list = await loop.run_in_executor(None, self._local_games_list)
         notify_list = self.backend_client._get_state_changes(self.local_games_cache, new_list)
         self.local_games_cache = new_list
+        logging.debug("Update local games: local games cache is now %s", self.local_games_cache)
         for local_game_notify in notify_list:
             self.update_local_game_status(local_game_notify)
 
