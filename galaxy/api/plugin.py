@@ -2,16 +2,21 @@ import asyncio
 import dataclasses
 import json
 import logging
-import logging.handlers
 import sys
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Union
 
-from galaxy.api.consts import Feature
+from galaxy.api.consts import Feature, OSCompatibility
 from galaxy.api.errors import ImportInProgress, UnknownError
-from galaxy.api.jsonrpc import ApplicationError, NotificationClient, Server
-from galaxy.api.types import Achievement, Authentication, FriendInfo, Game, GameTime, LocalGame, NextStep, GameLibrarySettings
+from galaxy.api.jsonrpc import ApplicationError, Connection
+from galaxy.api.types import (
+    Achievement, Authentication, Game, GameLibrarySettings, GameTime, LocalGame, NextStep, UserInfo, UserPresence
+)
 from galaxy.task_manager import TaskManager
+
+
+logger = logging.getLogger(__name__)
+
 
 class JSONEncoder(json.JSONEncoder):
     def default(self, o):  # pylint: disable=method-hidden
@@ -30,7 +35,7 @@ class Plugin:
     """Use and override methods of this class to create a new platform integration."""
 
     def __init__(self, platform, version, reader, writer, handshake_token):
-        logging.info("Creating plugin for platform %s, version %s", platform.value, version)
+        logger.info("Creating plugin for platform %s, version %s", platform.value, version)
         self._platform = platform
         self._version = version
 
@@ -41,12 +46,13 @@ class Plugin:
         self._handshake_token = handshake_token
 
         encoder = JSONEncoder()
-        self._server = Server(self._reader, self._writer, encoder)
-        self._notification_client = NotificationClient(self._writer, encoder)
+        self._connection = Connection(self._reader, self._writer, encoder)
 
         self._achievements_import_in_progress = False
         self._game_times_import_in_progress = False
         self._game_library_settings_import_in_progress = False
+        self._os_compatibility_import_in_progress = False
+        self._user_presence_import_in_progress = False
 
         self._persistent_cache = dict()
 
@@ -113,6 +119,12 @@ class Plugin:
         self._register_method("start_game_library_settings_import", self._start_game_library_settings_import)
         self._detect_feature(Feature.ImportGameLibrarySettings, ["get_game_library_settings"])
 
+        self._register_method("start_os_compatibility_import", self._start_os_compatibility_import)
+        self._detect_feature(Feature.ImportOSCompatibility, ["get_os_compatibility"])
+
+        self._register_method("start_user_presence_import", self._start_user_presence_import)
+        self._detect_feature(Feature.ImportUserPresence, ["get_user_presence"])
+
     async def __aenter__(self):
         return self
 
@@ -153,7 +165,7 @@ class Plugin:
                 result = handler(*args, **kwargs)
                 return wrap_result(result)
 
-            self._server.register_method(name, method, True, sensitive_params)
+            self._connection.register_method(name, method, True, sensitive_params)
         else:
             async def method(*args, **kwargs):
                 if not internal:
@@ -163,37 +175,40 @@ class Plugin:
                 result = await handler_(*args, **kwargs)
                 return wrap_result(result)
 
-            self._server.register_method(name, method, False, sensitive_params)
+            self._connection.register_method(name, method, False, sensitive_params)
 
     def _register_notification(self, name, handler, internal=False, immediate=False, sensitive_params=False):
         if not internal and not immediate:
             handler = self._wrap_external_method(handler, name)
-        self._server.register_notification(name, handler, immediate, sensitive_params)
+        self._connection.register_notification(name, handler, immediate, sensitive_params)
 
     def _wrap_external_method(self, handler, name: str):
         async def wrapper(*args, **kwargs):
             return await self._external_task_manager.create_task(handler(*args, **kwargs), name, False)
+
         return wrapper
 
     async def run(self):
         """Plugin's main coroutine."""
-        await self._server.run()
+        await self._connection.run()
+        logger.debug("Plugin run loop finished")
 
     def close(self) -> None:
         if not self._active:
             return
 
-        logging.info("Closing plugin")
-        self._server.close()
+        logger.info("Closing plugin")
+        self._connection.close()
         self._external_task_manager.cancel()
         self._internal_task_manager.create_task(self.shutdown(), "shutdown")
         self._active = False
 
     async def wait_closed(self) -> None:
+        logger.debug("Waiting for plugin to close")
         await self._external_task_manager.wait()
         await self._internal_task_manager.wait()
-        await self._server.wait_closed()
-        await self._notification_client.close()
+        await self._connection.wait_closed()
+        logger.debug("Plugin closed")
 
     def create_task(self, coro, description):
         """Wrapper around asyncio.create_task - takes care of canceling tasks on shutdown"""
@@ -204,11 +219,11 @@ class Plugin:
             try:
                 self.tick()
             except Exception:
-                logging.exception("Unexpected exception raised in plugin tick")
+                logger.exception("Unexpected exception raised in plugin tick")
             await asyncio.sleep(1)
 
     async def _shutdown(self):
-        logging.info("Shutting down")
+        logger.info("Shutting down")
         self.close()
         await self._external_task_manager.wait()
         await self._internal_task_manager.wait()
@@ -225,7 +240,7 @@ class Plugin:
         try:
             self.handshake_complete()
         except Exception:
-            logging.exception("Unhandled exception during `handshake_complete` step")
+            logger.exception("Unhandled exception during `handshake_complete` step")
         self._internal_task_manager.create_task(self._pass_control(), "tick")
 
     @staticmethod
@@ -256,9 +271,9 @@ class Plugin:
 
         """
         # temporary solution for persistent_cache vs credentials issue
-        self.persistent_cache['credentials'] = credentials  # type: ignore
+        self.persistent_cache["credentials"] = credentials  # type: ignore
 
-        self._notification_client.notify("store_credentials", credentials, sensitive_params=True)
+        self._connection.send_notification("store_credentials", credentials, sensitive_params=True)
 
     def add_game(self, game: Game) -> None:
         """Notify the client to add game to the list of owned games
@@ -280,7 +295,7 @@ class Plugin:
 
         """
         params = {"owned_game": game}
-        self._notification_client.notify("owned_game_added", params)
+        self._connection.send_notification("owned_game_added", params)
 
     def remove_game(self, game_id: str) -> None:
         """Notify the client to remove game from the list of owned games
@@ -302,7 +317,7 @@ class Plugin:
 
         """
         params = {"game_id": game_id}
-        self._notification_client.notify("owned_game_removed", params)
+        self._connection.send_notification("owned_game_removed", params)
 
     def update_game(self, game: Game) -> None:
         """Notify the client to update the status of a game
@@ -311,7 +326,7 @@ class Plugin:
         :param game: Game to update
         """
         params = {"owned_game": game}
-        self._notification_client.notify("owned_game_updated", params)
+        self._connection.send_notification("owned_game_updated", params)
 
     def unlock_achievement(self, game_id: str, achievement: Achievement) -> None:
         """Notify the client to unlock an achievement for a specific game.
@@ -323,24 +338,24 @@ class Plugin:
             "game_id": game_id,
             "achievement": achievement
         }
-        self._notification_client.notify("achievement_unlocked", params)
+        self._connection.send_notification("achievement_unlocked", params)
 
     def _game_achievements_import_success(self, game_id: str, achievements: List[Achievement]) -> None:
         params = {
             "game_id": game_id,
             "unlocked_achievements": achievements
         }
-        self._notification_client.notify("game_achievements_import_success", params)
+        self._connection.send_notification("game_achievements_import_success", params)
 
     def _game_achievements_import_failure(self, game_id: str, error: ApplicationError) -> None:
         params = {
             "game_id": game_id,
             "error": error.json()
         }
-        self._notification_client.notify("game_achievements_import_failure", params)
+        self._connection.send_notification("game_achievements_import_failure", params)
 
     def _achievements_import_finished(self) -> None:
-        self._notification_client.notify("achievements_import_finished", None)
+        self._connection.send_notification("achievements_import_finished", None)
 
     def update_local_game_status(self, local_game: LocalGame) -> None:
         """Notify the client to update the status of a local game.
@@ -366,15 +381,15 @@ class Plugin:
                     self._check_statuses_task = asyncio.create_task(self._check_statuses())
         """
         params = {"local_game": local_game}
-        self._notification_client.notify("local_game_status_changed", params)
+        self._connection.send_notification("local_game_status_changed", params)
 
-    def add_friend(self, user: FriendInfo) -> None:
+    def add_friend(self, user: UserInfo) -> None:
         """Notify the client to add a user to friends list of the currently authenticated user.
 
-        :param user: FriendInfo of a user that the client will add to friends list
+        :param user: UserInfo of a user that the client will add to friends list
         """
         params = {"friend_info": user}
-        self._notification_client.notify("friend_added", params)
+        self._connection.send_notification("friend_added", params)
 
     def remove_friend(self, user_id: str) -> None:
         """Notify the client to remove a user from friends list of the currently authenticated user.
@@ -382,7 +397,14 @@ class Plugin:
         :param user_id: id of the user to remove from friends list
         """
         params = {"user_id": user_id}
-        self._notification_client.notify("friend_removed", params)
+        self._connection.send_notification("friend_removed", params)
+
+    def update_friend_info(self, user: UserInfo) -> None:
+        """Notify the client about the updated friend information.
+
+        :param user: UserInfo of a friend whose info was updated
+        """
+        self._connection.send_notification("friend_updated", params={"friend_info": user})
 
     def update_game_time(self, game_time: GameTime) -> None:
         """Notify the client to update game time for a game.
@@ -390,50 +412,109 @@ class Plugin:
         :param game_time: game time to update
         """
         params = {"game_time": game_time}
-        self._notification_client.notify("game_time_updated", params)
+        self._connection.send_notification("game_time_updated", params)
+
+    def update_user_presence(self, user_id: str, user_presence: UserPresence) -> None:
+        """Notify the client about the updated user presence information.
+
+        :param user_id: the id of the user whose presence information is updated
+        :param user_presence: presence information of the specified user
+        """
+        self._connection.send_notification(
+            "user_presence_updated",
+            {
+                "user_id": user_id,
+                "presence": user_presence
+            }
+        )
 
     def _game_time_import_success(self, game_time: GameTime) -> None:
         params = {"game_time": game_time}
-        self._notification_client.notify("game_time_import_success", params)
+        self._connection.send_notification("game_time_import_success", params)
 
     def _game_time_import_failure(self, game_id: str, error: ApplicationError) -> None:
         params = {
             "game_id": game_id,
             "error": error.json()
         }
-        self._notification_client.notify("game_time_import_failure", params)
+        self._connection.send_notification("game_time_import_failure", params)
 
     def _game_times_import_finished(self) -> None:
-        self._notification_client.notify("game_times_import_finished", None)
+        self._connection.send_notification("game_times_import_finished", None)
 
     def _game_library_settings_import_success(self, game_library_settings: GameLibrarySettings) -> None:
         params = {"game_library_settings": game_library_settings}
-        self._notification_client.notify("game_library_settings_import_success", params)
+        self._connection.send_notification("game_library_settings_import_success", params)
 
     def _game_library_settings_import_failure(self, game_id: str, error: ApplicationError) -> None:
         params = {
             "game_id": game_id,
             "error": error.json()
         }
-        self._notification_client.notify("game_library_settings_import_failure", params)
+        self._connection.send_notification("game_library_settings_import_failure", params)
 
     def _game_library_settings_import_finished(self) -> None:
-        self._notification_client.notify("game_library_settings_import_finished", None)
+        self._connection.send_notification("game_library_settings_import_finished", None)
+
+    def _os_compatibility_import_success(self, game_id: str, os_compatibility: Optional[OSCompatibility]) -> None:
+        self._connection.send_notification(
+            "os_compatibility_import_success",
+            {
+                "game_id": game_id,
+                "os_compatibility": os_compatibility
+            }
+        )
+
+    def _os_compatibility_import_failure(self, game_id: str, error: ApplicationError) -> None:
+        self._connection.send_notification(
+            "os_compatibility_import_failure",
+            {
+                "game_id": game_id,
+                "error": error.json()
+            }
+        )
+
+    def _os_compatibility_import_finished(self) -> None:
+        self._connection.send_notification("os_compatibility_import_finished", None)
+
+    def _user_presence_import_success(self, user_id: str, user_presence: UserPresence) -> None:
+        self._connection.send_notification(
+            "user_presence_import_success",
+            {
+                "user_id": user_id,
+                "presence": user_presence
+            }
+        )
+
+    def _user_presence_import_failure(self, user_id: str, error: ApplicationError) -> None:
+        self._connection.send_notification(
+            "user_presence_import_failure",
+            {
+                "user_id": user_id,
+                "error": error.json()
+            }
+        )
+
+    def _user_presence_import_finished(self) -> None:
+        self._connection.send_notification("user_presence_import_finished", None)
 
     def lost_authentication(self) -> None:
         """Notify the client that integration has lost authentication for the
          current user and is unable to perform actions which would require it.
          """
-        self._notification_client.notify("authentication_lost", None)
+        self._connection.send_notification("authentication_lost", None)
 
     def push_cache(self) -> None:
         """Push local copy of the persistent cache to the GOG Galaxy Client replacing existing one.
         """
-        self._notification_client.notify(
+        self._connection.send_notification(
             "push_cache",
             params={"data": self._persistent_cache},
             sensitive_params="data"
         )
+
+    async def refresh_credentials(self, params: Dict[str, Any], sensitive_params) -> Dict[str, Any]:
+        return await self._connection.send_request("refresh_credentials", params, sensitive_params)
 
     # handlers
     def handshake_complete(self) -> None:
@@ -499,10 +580,11 @@ class Plugin:
 
     async def pass_login_credentials(self, step: str, credentials: Dict[str, str], cookies: List[Dict[str, str]]) \
         -> Union[NextStep, Authentication]:
-        """This method is called if we return galaxy.api.types.NextStep from authenticate or from pass_login_credentials.
+        """This method is called if we return :class:`~galaxy.api.types.NextStep` from :meth:`.authenticate`
+        or :meth:`.pass_login_credentials`.
         This method's parameters provide the data extracted from the web page navigation that previous NextStep finished on.
-        This method should either return galaxy.api.types.Authentication if the authentication is finished
-        or galaxy.api.types.NextStep if it requires going to another cef url.
+        This method should either return :class:`~galaxy.api.types.Authentication` if the authentication is finished
+        or :class:`~galaxy.api.types.NextStep` if it requires going to another cef url.
         This method is called by the GOG Galaxy Client.
 
         :param step: deprecated.
@@ -559,7 +641,7 @@ class Plugin:
             except ApplicationError as error:
                 self._game_achievements_import_failure(game_id, error)
             except Exception:
-                logging.exception("Unexpected exception raised in import_game_achievements")
+                logger.exception("Unexpected exception raised in import_game_achievements")
                 self._game_achievements_import_failure(game_id, UnknownError())
 
         async def import_games_achievements(game_ids_, context_):
@@ -690,7 +772,7 @@ class Plugin:
         This method is called by the GOG Galaxy Client."""
         raise NotImplementedError()
 
-    async def get_friends(self) -> List[FriendInfo]:
+    async def get_friends(self) -> List[UserInfo]:
         """Override this method to return the friends list
         of the currently authenticated user.
         This method is called by the GOG Galaxy Client.
@@ -723,7 +805,7 @@ class Plugin:
             except ApplicationError as error:
                 self._game_time_import_failure(game_id, error)
             except Exception:
-                logging.exception("Unexpected exception raised in import_game_time")
+                logger.exception("Unexpected exception raised in import_game_time")
                 self._game_time_import_failure(game_id, UnknownError())
 
         async def import_game_times(game_ids_, context_):
@@ -781,7 +863,7 @@ class Plugin:
             except ApplicationError as error:
                 self._game_library_settings_import_failure(game_id, error)
             except Exception:
-                logging.exception("Unexpected exception raised in import_game_library_settings")
+                logger.exception("Unexpected exception raised in import_game_library_settings")
                 self._game_library_settings_import_failure(game_id, UnknownError())
 
         async def import_game_library_settings_set(game_ids_, context_):
@@ -805,7 +887,7 @@ class Plugin:
         This allows for optimizations like batch requests to platform API.
         Default implementation returns None.
 
-        :param game_ids: the ids of the games for which game time are imported
+        :param game_ids: the ids of the games for which game library settings are imported
         :return: context
         """
         return None
@@ -815,16 +897,129 @@ class Plugin:
         identified by the provided game_id.
         This method is called by import task initialized by GOG Galaxy Client.
 
-        :param game_id: the id of the game for which the game time is returned
+        :param game_id: the id of the game for which the game library settings are imported
         :param context: the value returned from :meth:`prepare_game_library_settings_context`
         :return: GameLibrarySettings object
         """
         raise NotImplementedError()
 
     def game_library_settings_import_complete(self) -> None:
-        """Override this method to handle operations after game times import is finished
+        """Override this method to handle operations after game library settings import is finished
         (like updating cache).
         """
+
+    async def _start_os_compatibility_import(self, game_ids: List[str]) -> None:
+        if self._os_compatibility_import_in_progress:
+            raise ImportInProgress()
+
+        context = await self.prepare_os_compatibility_context(game_ids)
+
+        async def import_os_compatibility(game_id, context_):
+            try:
+                os_compatibility = await self.get_os_compatibility(game_id, context_)
+                self._os_compatibility_import_success(game_id, os_compatibility)
+            except ApplicationError as error:
+                self._os_compatibility_import_failure(game_id, error)
+            except Exception:
+                logger.exception("Unexpected exception raised in import_os_compatibility")
+                self._os_compatibility_import_failure(game_id, UnknownError())
+
+        async def import_os_compatibility_set(game_ids_, context_):
+            try:
+                await asyncio.gather(*[
+                    import_os_compatibility(game_id, context_) for game_id in game_ids_
+                ])
+            finally:
+                self._os_compatibility_import_finished()
+                self._os_compatibility_import_in_progress = False
+                self.os_compatibility_import_complete()
+
+        self._external_task_manager.create_task(
+            import_os_compatibility_set(game_ids, context),
+            "game OS compatibility import",
+            handle_exceptions=False
+        )
+        self._os_compatibility_import_in_progress = True
+
+    async def prepare_os_compatibility_context(self, game_ids: List[str]) -> Any:
+        """Override this method to prepare context for get_os_compatibility.
+        This allows for optimizations like batch requests to platform API.
+        Default implementation returns None.
+
+        :param game_ids: the ids of the games for which game os compatibility is imported
+        :return: context
+        """
+        return None
+
+    async def get_os_compatibility(self, game_id: str, context: Any) -> Optional[OSCompatibility]:
+        """Override this method to return the OS compatibility for the game with the provided game_id.
+        This method is called by import task initialized by GOG Galaxy Client.
+
+        :param game_id: the id of the game for which the game os compatibility is imported
+        :param context: the value returned from :meth:`prepare_os_compatibility_context`
+        :return: OSCompatibility flags indicating compatible OSs, or None if compatibility is not know
+        """
+        raise NotImplementedError()
+
+    def os_compatibility_import_complete(self) -> None:
+        """Override this method to handle operations after OS compatibility import is finished (like updating cache)."""
+
+    async def _start_user_presence_import(self, user_ids: List[str]) -> None:
+        if self._user_presence_import_in_progress:
+            raise ImportInProgress()
+
+        context = await self.prepare_user_presence_context(user_ids)
+
+        async def import_user_presence(user_id, context_) -> None:
+            try:
+                self._user_presence_import_success(user_id, await self.get_user_presence(user_id, context_))
+            except ApplicationError as error:
+                self._user_presence_import_failure(user_id, error)
+            except Exception:
+                logger.exception("Unexpected exception raised in import_user_presence")
+                self._user_presence_import_failure(user_id, UnknownError())
+
+        async def import_user_presence_set(user_ids_, context_) -> None:
+            try:
+                await asyncio.gather(*[
+                    import_user_presence(user_id, context_)
+                    for user_id in user_ids_
+                ])
+            finally:
+                self._user_presence_import_finished()
+                self._user_presence_import_in_progress = False
+                self.user_presence_import_complete()
+
+        self._external_task_manager.create_task(
+            import_user_presence_set(user_ids, context),
+            "user presence import",
+            handle_exceptions=False
+        )
+        self._user_presence_import_in_progress = True
+
+    async def prepare_user_presence_context(self, user_ids: List[str]) -> Any:
+        """Override this method to prepare context for get_user_presence.
+        This allows for optimizations like batch requests to platform API.
+        Default implementation returns None.
+
+        :param user_ids: the ids of the users for whom presence information is imported
+        :return: context
+        """
+        return None
+
+    async def get_user_presence(self, user_id: str, context: Any) -> UserPresence:
+        """Override this method to return presence information for the user with the provided user_id.
+        This method is called by import task initialized by GOG Galaxy Client.
+
+        :param user_id: the id of the user for whom presence information is imported
+        :param context: the value returned from :meth:`prepare_user_presence_context`
+        :return: UserPresence presence information of the provided user
+        """
+        raise NotImplementedError()
+
+    def user_presence_import_complete(self) -> None:
+        """Override this method to handle operations after presence import is finished (like updating cache)."""
+
 
 def create_and_run_plugin(plugin_class, argv):
     """Call this method as an entry point for the implemented integration.
@@ -844,7 +1039,7 @@ def create_and_run_plugin(plugin_class, argv):
                 main()
     """
     if len(argv) < 3:
-        logging.critical("Not enough parameters, required: token, port")
+        logger.critical("Not enough parameters, required: token, port")
         sys.exit(1)
 
     token = argv[1]
@@ -852,21 +1047,21 @@ def create_and_run_plugin(plugin_class, argv):
     try:
         port = int(argv[2])
     except ValueError:
-        logging.critical("Failed to parse port value: %s", argv[2])
+        logger.critical("Failed to parse port value: %s", argv[2])
         sys.exit(2)
 
     if not (1 <= port <= 65535):
-        logging.critical("Port value out of range (1, 65535)")
+        logger.critical("Port value out of range (1, 65535)")
         sys.exit(3)
 
     if not issubclass(plugin_class, Plugin):
-        logging.critical("plugin_class must be subclass of Plugin")
+        logger.critical("plugin_class must be subclass of Plugin")
         sys.exit(4)
 
     async def coroutine():
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         extra_info = writer.get_extra_info("sockname")
-        logging.info("Using local address: %s:%u", *extra_info)
+        logger.info("Using local address: %s:%u", *extra_info)
         async with plugin_class(reader, writer, token) as plugin:
             await plugin.run()
 
@@ -876,5 +1071,5 @@ def create_and_run_plugin(plugin_class, argv):
 
         asyncio.run(coroutine())
     except Exception:
-        logging.exception("Error while running plugin")
+        logger.exception("Error while running plugin")
         sys.exit(5)
