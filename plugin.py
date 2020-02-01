@@ -6,27 +6,41 @@ import subprocess
 import sys
 import time
 
-import user_config
-from backend import BackendClient
+import config
+from backend import AuthenticationServer
 from galaxy.api.consts import LicenseType, LocalGameState, Platform
 from galaxy.api.plugin import Plugin, create_and_run_plugin
 from galaxy.api.types import (Authentication, Game, GameTime, LicenseInfo,
-                              LocalGame)
+                              LocalGame, NextStep)
+from SNESClient import SNESClient
 from version import __version__
 
 
 class SuperNintendoEntertainmentSystemPlugin(Plugin):
     def __init__(self, reader, writer, token):
         super().__init__(Platform.SuperNintendoEntertainmentSystem, __version__, reader, writer, token)
-        self.backend_client = BackendClient()
+        self.config = config.Config()
+        self.auth_server = AuthenticationServer()
+        self.auth_server.start()
         self.games = []
         self.local_games_cache = []
         self.proc = None
+        self.snes_client = SNESClient(self)
         self.running_game_id = ""
         self.tick_count = 0
 
         
     async def authenticate(self, stored_credentials=None):
+        if not stored_credentials:
+            PARAMS = {
+                "window_title": "Configure SNES Integration",
+                "window_width": 550,
+                "window_height": 730,
+                "start_uri": "http://localhost:" + str(self.auth_server.port),
+                "end_uri_regex": ".*/end.*"
+            }
+            return NextStep("web_session", PARAMS)
+
         return self._do_auth()
 
         
@@ -36,19 +50,22 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
 
     def _do_auth(self) -> Authentication:
         user_data = {}
-        username = user_config.roms_path
-        user_data["username"] = username
+        self.config.cfg.read(os.path.expandvars(config.CONFIG_LOC))
+        user_data["username"] = self.config.cfg.get("Paths", "roms_path")
         self.store_credentials(user_data)
         return Authentication("bsnes_user", user_data["username"])
 
 
     async def launch_game(self, game_id):
         self.running_game_id = game_id
-        emu_path = user_config.emu_path
-        fullscreen = user_config.emu_fullscreen
+        logging.debug("DEV: Running game id is - %s", self.running_game_id)
+        self.config.cfg.read(os.path.expandvars(config.CONFIG_LOC))
+        emu_path = self.config.cfg.get("Paths", "emu_path")
+        fullscreen = self.config.cfg.getboolean("EmuSettings", "emu_fullscreen")
 
         self._launch_game(game_id, emu_path, fullscreen)
-        self.backend_client._set_session_start()
+        logging.debug("DEV: Launch game has been called")
+        self.snes_client._set_session_start()
 
 
     def _launch_game(self, game_id, emu_path, fullscreen) -> None:
@@ -63,6 +80,7 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
                     args.append("--fullscreen")
                 args.append(game.path)
                 self.proc = subprocess.Popen(args)
+                logging.debug("DEV: Game has been launched with args - %s", args)
                 break
 
 
@@ -88,13 +106,13 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         
         Creates and reads the game_times.json file
         '''
-        base_dir = os.path.dirname(os.path.realpath(__file__))
         data = {}
         game_times = {}
-        path = "{}/game_times.json".format(base_dir)
+        path = os.path.expandvars(r"%LOCALAPPDATA%\GOG.com\Galaxy\Configuration\plugins\snes\game_times.json")
         
         # Check if the file exists, otherwise create it with defaults
         if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path))
             for game in self.games:
                 data[game.id] = { "name": game.name, "time_played": 0, "last_time_played": None }
 
@@ -145,8 +163,9 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
 
     def _check_emu_status(self) -> None:
         try:
-            if(self.proc.poll() is not None):
-                self.backend_client._set_session_end()
+            if self.proc.poll() is not None:
+                logging.debug("DEV: Emulator process has been closed")
+                self.snes_client._set_session_end()
                 session_duration = self.backend_client._get_session_duration()
                 last_time_played = int(time.time())
                 self._update_game_time(self.running_game_id, session_duration, last_time_played)
@@ -159,9 +178,9 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
     async def _update_local_games(self) -> None:
         loop = asyncio.get_running_loop()
         new_list = await loop.run_in_executor(None, self._local_games_list)
-        notify_list = self.backend_client._get_state_changes(self.local_games_cache, new_list)
+        notify_list = self.snes_client._get_state_changes(self.local_games_cache, new_list)
         self.local_games_cache = new_list
-        logging.debug("Update local games: local games cache is now %s", self.local_games_cache)
+        logging.debug("DEV: Local games cache is - %s", self.local_games_cache)
         for local_game_notify in notify_list:
             self.update_local_game_status(local_game_notify)
 
@@ -179,16 +198,15 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         
         Update the game time of a single game
         '''
-        base_dir = os.path.dirname(os.path.realpath(__file__))
-        game_times_path = "{}/game_times.json".format(base_dir)
+        path = os.path.expandvars(r"%LOCALAPPDATA%\GOG.com\Galaxy\Configuration\plugins\snes\game_times.json")
 
-        with open(game_times_path, encoding="utf-8") as game_times_file:
+        with open(path, encoding="utf-8") as game_times_file:
             data = json.load(game_times_file)
 
         data[game_id]["time_played"] = data.get(game_id).get("time_played") + session_duration
         data[game_id]["last_time_played"] = last_time_played
 
-        with open(game_times_path, "w", encoding="utf-8") as game_times_file:
+        with open(path, "w", encoding="utf-8") as game_times_file:
             json.dump(data, game_times_file, indent=4)
 
         self.update_game_time(GameTime(game_id, data.get(game_id).get("time_played"), last_time_played))
@@ -196,7 +214,7 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
 
     async def get_owned_games(self):
         owned_games = []
-        self.games = self.backend_client._get_games_giant_bomb()
+        self.games = self.snes_client._get_games_giant_bomb()
         
         for game in self.games:
             owned_games.append(
@@ -212,6 +230,9 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
 
     async def get_local_games(self):
         return self.local_games_cache
+
+    async def shutdown(self):
+        self.auth_server.httpd.shutdown()
 
 
 def main():
