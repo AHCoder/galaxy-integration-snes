@@ -2,10 +2,10 @@
     "name": "Galaxy SNES Plugin",
     "platform": "snes",
     "guid": "aa7db44d-b70b-4774-91da-db1034318d3c",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "Galaxy SNES Plugin",
     "author": "AHCoder",
-    "email": "",
+    "email": "AHCoder@users.noreply.github.com",
     "url": "https://github.com/AHCoder/galaxy-integration-snes",
     "script": "plugin.py"
 }

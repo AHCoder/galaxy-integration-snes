@@ -6,28 +6,33 @@ import subprocess
 import sys
 import time
 
-import config
-from backend import AuthenticationServer
-from galaxy.api.consts import LicenseType, LocalGameState, Platform
-from galaxy.api.plugin import Plugin, create_and_run_plugin
-from galaxy.api.types import (Authentication, Game, GameTime, LicenseInfo,
-                              LocalGame, NextStep)
-from SNESClient import SNESClient
-from version import __version__
+from . import config
+from .backend import AuthenticationServer
+from .galaxy.api.consts import LicenseType, LocalGameState, Platform
+from .galaxy.api.plugin import Plugin, create_and_run_plugin
+from .galaxy.api.types import (Authentication, Game, GameTime, LicenseInfo,
+                               LocalGame, NextStep)
+from .SNESClient import SNESClient
+from .version import __version__
 
 
 class SuperNintendoEntertainmentSystemPlugin(Plugin):
     def __init__(self, reader, writer, token):
         super().__init__(Platform.SuperNintendoEntertainmentSystem, __version__, reader, writer, token)
+        
+        ### Variables ###
         self.config = config.Config()
         self.auth_server = AuthenticationServer()
         self.auth_server.start()
         self.games = []
-        self.local_games_cache = []
+        self.local_games_cache = None
         self.proc = None
         self.snes_client = SNESClient(self)
         self.running_game_id = ""
         self.tick_count = 0
+
+        ### Tasks ###
+        self.update_local_games_task = self.create_task(asyncio.sleep(0), "Update local games")
 
         
     async def authenticate(self, stored_credentials=None):
@@ -92,6 +97,26 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         pass
 
 
+    async def prepare_local_size_context(self, game_ids):
+        return self._get_local_size_dict()
+
+
+    async def get_local_size(self, game_id, context):
+        local_size = context.get(game_id)
+        return local_size
+
+
+    def _get_local_size_dict(self) -> dict:
+        ''' Returns a dict of game sizes
+        '''
+        local_sizes = {}
+        for game in self.games:
+            local_size = os.path.getsize(game.path)
+            local_sizes[game.id] = local_size
+
+        return local_sizes
+
+
     async def prepare_game_times_context(self, game_ids):
         return self._get_games_times_dict()
 
@@ -106,29 +131,39 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         
         Creates and reads the game_times.json file
         '''
-        data = {}
         game_times = {}
         path = os.path.expandvars(r"%LOCALAPPDATA%\GOG.com\Galaxy\Configuration\plugins\snes\game_times.json")
-        
-        # Check if the file exists, otherwise create it with defaults
-        if not os.path.exists(path):
-            os.makedirs(os.path.dirname(path))
-            for game in self.games:
-                data[game.id] = { "name": game.name, "time_played": 0, "last_time_played": None }
+        update_file = False
 
+        # Read the games times json
+        try:
+            with open(path, encoding="utf-8") as game_times_file:
+                data = json.load(game_times_file)
+        except FileNotFoundError:
+            data = {}
+
+            if not os.path.isdir(os.path.dirname(path)):
+                os.makedirs(os.path.dirname(path))
+                
+            with open(path, "w", encoding="utf-8") as game_times_file:
+                json.dump(data, game_times_file, indent=4)
+
+        for game in self.games:
+            if game.id in data:
+                time_played = data.get(game.id).get("time_played")
+                last_time_played = data.get(game.id).get("last_time_played")
+            else:
+                time_played = 0
+                last_time_played = None
+                data[game.id] = { "name": game.name, "time_played": 0, "last_time_played": None }
+                update_file = True
+            
+            game_times[game.id] = GameTime(game.id, time_played, last_time_played)
+
+        if update_file == True:
             with open(path, "w", encoding="utf-8") as game_times_file:
                 json.dump(data, game_times_file, indent=4)
         
-        # Now read it and return the game times
-        with open(path, encoding="utf-8") as game_times_file:
-            parsed_game_times_file = json.load(game_times_file)
-
-        for entry in parsed_game_times_file:
-            game_id = entry
-            time_played = parsed_game_times_file.get(entry).get("time_played")
-            last_time_played = parsed_game_times_file.get(entry).get("last_time_played")
-            game_times[game_id] = GameTime(game_id, time_played, last_time_played)
-
         return game_times
 
 
@@ -154,9 +189,11 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
 
     def tick(self):
         self._check_emu_status()
-        self.create_task(self._update_local_games(), "Update local games")
-        self.tick_count += 1
 
+        if self.local_games_cache is not None and self.update_local_games_task.done():
+            self.update_local_games_task = self.create_task(self._update_local_games(), "Update local games")
+        
+        self.tick_count += 1
         if self.tick_count % 12 == 0:
             self.create_task(self._update_all_game_times(), "Update all game times")
 
@@ -166,7 +203,7 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
             if self.proc.poll() is not None:
                 logging.debug("DEV: Emulator process has been closed")
                 self.snes_client._set_session_end()
-                session_duration = self.backend_client._get_session_duration()
+                session_duration = self.snes_client._get_session_duration()
                 last_time_played = int(time.time())
                 self._update_game_time(self.running_game_id, session_duration, last_time_played)
                 self.proc = None
@@ -181,12 +218,12 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         notify_list = self.snes_client._get_state_changes(self.local_games_cache, new_list)
         self.local_games_cache = new_list
         logging.debug("DEV: Local games cache is - %s", self.local_games_cache)
-        for local_game_notify in notify_list:
-            self.update_local_game_status(local_game_notify)
+        for game in notify_list:
+            self.update_local_game_status(game)
+        await asyncio.sleep(5)
 
 
     async def _update_all_game_times(self) -> None:
-        await asyncio.sleep(60) # Leave time for Galaxy to fetch games before updating times
         loop = asyncio.get_running_loop()
         new_game_times = await loop.run_in_executor(None, self._get_games_times_dict)
         for game_time in new_game_times:
@@ -229,6 +266,8 @@ class SuperNintendoEntertainmentSystemPlugin(Plugin):
         
 
     async def get_local_games(self):
+        loop = asyncio.get_running_loop()
+        self.local_games_cache = await loop.run_in_executor(None, self._local_games_list)
         return self.local_games_cache
 
     async def shutdown(self):

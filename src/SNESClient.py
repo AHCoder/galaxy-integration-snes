@@ -5,9 +5,9 @@ import time
 import urllib.parse
 import urllib.request
 
-import config
-from definitions import SNESGame
-from galaxy.api.types import LocalGame, LocalGameState
+from . import config
+from .definitions import SNESGame
+from .galaxy.api.types import LocalGame, LocalGameState
 
 QUERY_URL = "https://www.giantbomb.com/api/search/?api_key={}&field_list=id,name&format=json&limit=1&query={}&resources=game"
 
@@ -59,7 +59,7 @@ class SNESClient:
     def _get_rom_names(self) -> None:
         ''' Returns none
         
-        Adds the rom name and path to the roms dict
+        Appends the rom names and paths to their corresponding lists
         '''
         self.plugin.config.cfg.read(os.path.expandvars(config.CONFIG_LOC))        
         for root, dirs, files in os.walk(self.plugin.config.cfg.get("Paths", "roms_path")):
@@ -80,8 +80,7 @@ class SNESClient:
         result.extend(local_game for local_game in new_list if local_game.game_id in new_dict.keys() - old_dict.keys())
         # state changed
         result.extend(
-            LocalGame(id, new_dict[id]) for id in new_dict.keys() & old_dict.keys() if new_dict[id] != old_dict[id]
-            )
+            LocalGame(id, new_dict[id]) for id in new_dict.keys() & old_dict.keys() if new_dict[id] != old_dict[id])
         return result
 
     def _set_session_start(self) -> None:

@@ -13,4 +13,4 @@ SNES Integration for GOG Galaxy 2.0
 
 ## Installation and Config
 
-Download this repo, place it in the plugins/installed folder and rename it to "snes_aa7db44d-b70b-4774-91da-db1034318d3c"
+Download this repo, place the "src" folder in the plugins/installed folder and rename it to "snes_aa7db44d-b70b-4774-91da-db1034318d3c"
