@@ -6,14 +6,14 @@ import subprocess
 import sys
 import time
 
-from . import config
-from .backend import AuthenticationServer
-from .galaxy.api.consts import LicenseType, LocalGameState, Platform
-from .galaxy.api.plugin import Plugin, create_and_run_plugin
-from .galaxy.api.types import (Authentication, Game, GameTime, LicenseInfo,
+import config
+from backend import AuthenticationServer
+from galaxy.api.consts import LicenseType, LocalGameState, Platform
+from galaxy.api.plugin import Plugin, create_and_run_plugin
+from galaxy.api.types import (Authentication, Game, GameTime, LicenseInfo,
                                LocalGame, NextStep)
-from .SNESClient import SNESClient
-from .version import __version__
+from SNESClient import SNESClient
+from version import __version__
 
 
 class SuperNintendoEntertainmentSystemPlugin(Plugin):

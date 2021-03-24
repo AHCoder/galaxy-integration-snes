@@ -5,9 +5,9 @@ import time
 import urllib.parse
 import urllib.request
 
-from . import config
-from .definitions import SNESGame
-from .galaxy.api.types import LocalGame, LocalGameState
+import config
+from definitions import SNESGame
+from galaxy.api.types import LocalGame, LocalGameState
 
 QUERY_URL = "https://www.giantbomb.com/api/search/?api_key={}&field_list=id,name&format=json&limit=1&query={}&resources=game"
 

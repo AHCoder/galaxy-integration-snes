@@ -4,7 +4,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import config
+import config
 
 
 class AuthenticationHandler(BaseHTTPRequestHandler):
